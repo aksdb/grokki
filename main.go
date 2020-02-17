@@ -1,8 +1,11 @@
 package main
 
 import (
+	crand "crypto/rand"
+	"encoding/binary"
 	"github.com/alecthomas/kong"
 	"go.uber.org/zap"
+	"math/rand"
 )
 
 var cli struct {
@@ -11,6 +14,7 @@ var cli struct {
 
 func main() {
 	initLogger()
+	initRandom()
 
 	ctx := kong.Parse(&cli)
 	if err := ctx.Run(); err != nil {
@@ -24,4 +28,12 @@ func initLogger() {
 		panic(err)
 	}
 	zap.ReplaceGlobals(logger)
+}
+
+func initRandom() {
+	var seed int64
+	if err := binary.Read(crand.Reader, binary.BigEndian, &seed); err != nil {
+		zap.L().Fatal("Cannot read from random.", zap.Error(err))
+	}
+	rand.Seed(seed)
 }

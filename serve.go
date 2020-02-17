@@ -8,6 +8,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -146,11 +147,36 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 			return false, []byte{}
 		}
 
+		// Get the lock early on, because we need to determine a domain name
+		// which might need trial and error. Also we want to prevent to requests
+		// at the same time for the same domain being allowed just due to bad timing.
+		proxyLock.Lock()
+		defer proxyLock.Unlock()
+
 		subDomain := strings.TrimSpace(reqPayload.BindAddr)
-		if subDomain == "" {
-			subDomain = ctx.SessionID() // TODO some random stuff
+		if subDomain == "localhost" {
+			// SSH clients seem to set "localhost" by default.
+			subDomain = ""
 		}
-		domain := subDomain + "." + cli.Serve.BaseDomain
+
+		domain := buildDomainName(subDomain)
+
+		if subDomain != "" && activeProxies[domain] != nil {
+			zap.L().Warn("Request for domain denied, since the domain is already bound.", zap.String("domain", domain))
+			return false, nil
+		}
+
+		if subDomain == "" {
+			// Build random domain names until we find one that is not taken yet.
+			for {
+				subDomain = getRandomDomainName()
+				domain = buildDomainName(subDomain)
+
+				if activeProxies[domain] == nil {
+					break
+				}
+			}
+		}
 
 		dialFunc := func(ctx context.Context, network, address string) (net.Conn, error) {
 			payload := gossh.Marshal(&struct {
@@ -190,9 +216,7 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		}
 
 		zap.L().Info("Add domain binding.", zap.String("domain", domain))
-		proxyLock.Lock()
 		activeProxies[domain] = proxy
-		proxyLock.Unlock()
 		sessionInfo.AddBinding(reqPayload, domain)
 
 		return true, gossh.Marshal(&struct{ DestPort uint32 }{reqPayload.BindPort})
@@ -235,3 +259,18 @@ type dummyAddr string
 
 func (a dummyAddr) Network() string { return string(a) }
 func (a dummyAddr) String() string  { return string(a) }
+
+const domainAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+func getRandomDomainName() string {
+	const length = 10
+	result := make([]byte, length)
+	for i := 0; i < length; i++ {
+		result[i] = domainAlphabet[rand.Intn(len(domainAlphabet))]
+	}
+	return string(result)
+}
+
+func buildDomainName(subdomain string) string {
+	return subdomain + "." + cli.Serve.BaseDomain
+}
