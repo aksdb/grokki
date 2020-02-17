@@ -25,14 +25,35 @@ type ServeCmd struct {
 }
 
 func (r *ServeCmd) Run() error {
-	zap.L().Info("Serving")
+	zap.L().Info("Serving.", zap.String("domain", cli.Serve.BaseDomain))
 	sshForwardHandler := &ForwardedTCPHandler{}
 
 	ssh.Handle(func(session ssh.Session) {
-		EnsureSessionInfo(session.Context())
+		zap.L().Debug("Channel opened.")
+		sessionInfo := EnsureSessionInfo(session.Context())
+		msgChan := make(chan string, 1)
+		sessionInfo.SetMessageChan(msgChan)
+
+		// Report initial bindings
+		activeBindings := sessionInfo.ActiveBindings()
+		for k, v := range activeBindings {
+			fmt.Fprintln(session, bindingToString(k, v))
+		}
+
+		go func() {
+			for {
+				select {
+				case <-session.Context().Done():
+					// session closed, get out
+					return
+				case msg := <-msgChan:
+					fmt.Fprintln(session, msg)
+				}
+			}
+		}()
 
 		_, _ = io.Copy(ioutil.Discard, session)
-		session.Exit(0)
+		_ = session.Exit(0)
 	})
 	ssh.DefaultRequestHandlers["tcpip-forward"] = sshForwardHandler.HandleSSHRequest
 	ssh.DefaultRequestHandlers["cancel-tcpip-forward"] = sshForwardHandler.HandleSSHRequest
@@ -76,6 +97,7 @@ type BindInfo struct {
 type SessionInfo struct {
 	m           sync.Mutex
 	activeBinds map[BindInfo]string
+	msgChan     chan string
 }
 
 func (w *SessionInfo) AddBinding(info BindInfo, domain string) {
@@ -96,6 +118,16 @@ func (w *SessionInfo) GetBinding(info BindInfo) string {
 	return w.activeBinds[info]
 }
 
+func (w *SessionInfo) ActiveBindings() map[string]BindInfo {
+	w.m.Lock()
+	result := make(map[string]BindInfo)
+	for k, v := range w.activeBinds {
+		result[v] = k
+	}
+	w.m.Unlock()
+	return result
+}
+
 func (w *SessionInfo) Cleanup() {
 	w.m.Lock()
 	proxyLock.Lock()
@@ -108,9 +140,24 @@ func (w *SessionInfo) Cleanup() {
 	proxyLock.Unlock()
 }
 
+func (w *SessionInfo) SendMessage(msg string) {
+	w.m.Lock()
+	if w.msgChan != nil {
+		w.msgChan <- msg
+	}
+	w.m.Unlock()
+}
+
+func (w *SessionInfo) SetMessageChan(msgchan chan string) {
+	w.m.Lock()
+	w.msgChan = msgchan
+	w.m.Unlock()
+}
+
 func EnsureSessionInfo(ctx context.Context) *SessionInfo {
 	sessionLock.Lock()
 	defer sessionLock.Unlock()
+
 	sessionId := ctx.Value(ssh.ContextKeySessionID).(string)
 	sessionInfo := sessions[sessionId]
 	if sessionInfo == nil {
@@ -219,6 +266,8 @@ func (h *ForwardedTCPHandler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server,
 		activeProxies[domain] = proxy
 		sessionInfo.AddBinding(reqPayload, domain)
 
+		sessionInfo.SendMessage(bindingToString(domain, reqPayload))
+
 		return true, gossh.Marshal(&struct{ DestPort uint32 }{reqPayload.BindPort})
 
 	case "cancel-tcpip-forward":
@@ -273,4 +322,8 @@ func getRandomDomainName() string {
 
 func buildDomainName(subdomain string) string {
 	return subdomain + "." + cli.Serve.BaseDomain
+}
+
+func bindingToString(domain string, bindInfo BindInfo) string {
+	return fmt.Sprintf("%s forwarded to port %d", domain, bindInfo.BindPort)
 }
