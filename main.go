@@ -5,25 +5,38 @@ import (
 	"encoding/binary"
 	"github.com/alecthomas/kong"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"math/rand"
 )
 
 var cli struct {
+	Debug bool `help:"Enable debug logging." short:"d"`
+
 	Serve ServeCmd `cmd:"" default:"1" help:"Run the server part of grokki."`
 }
 
 func main() {
+	ctx := kong.Parse(&cli)
+
 	initLogger()
 	initRandom()
 
-	ctx := kong.Parse(&cli)
 	if err := ctx.Run(); err != nil {
 		zap.L().Fatal("Cannot run command.", zap.Error(err))
 	}
 }
 
 func initLogger() {
-	logger, err := zap.NewDevelopment()
+	var lc zap.Config
+	if cli.Debug {
+		lc = zap.NewDevelopmentConfig()
+		lc.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	} else {
+		lc = zap.NewProductionConfig()
+		lc.EncoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+	}
+
+	logger, err := lc.Build()
 	if err != nil {
 		panic(err)
 	}
