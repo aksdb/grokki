@@ -9,4 +9,5 @@ require (
 	github.com/gliderlabs/ssh v0.2.2
 	go.uber.org/zap v1.13.0
 	golang.org/x/crypto v0.0.0-20200206161412-a0c6ece9d31a
+	gopkg.in/yaml.v2 v2.2.2
 )

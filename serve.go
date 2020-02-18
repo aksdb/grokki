@@ -6,12 +6,14 @@ import (
 	"github.com/gliderlabs/ssh"
 	"go.uber.org/zap"
 	gossh "golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -22,9 +24,20 @@ type ServeCmd struct {
 	SshListenAddress  string `help:"Address to listen on for ssh connection." default:":2222"`
 	HttpListenAddress string `help:"Address to listen on for the http (proxy) connections." default:":2491"`
 	BaseDomain        string `help:"Domain to use as a base." required:""`
+	UsersFile         string `help:"File with authorized users. If not present, unauthorized requests are allowed." type:"existingfile"`
+}
+
+type User struct {
+	Password string
+	Key      ssh.PublicKey
 }
 
 func (r *ServeCmd) Run() error {
+	users, err := loadUsers()
+	if err != nil {
+		return fmt.Errorf("cannot load users: %w", err)
+	}
+
 	zap.L().Info("Serving.", zap.String("domain", cli.Serve.BaseDomain))
 	sshForwardHandler := &ForwardedTCPHandler{}
 
@@ -57,9 +70,31 @@ func (r *ServeCmd) Run() error {
 	})
 	ssh.DefaultRequestHandlers["tcpip-forward"] = sshForwardHandler.HandleSSHRequest
 	ssh.DefaultRequestHandlers["cancel-tcpip-forward"] = sshForwardHandler.HandleSSHRequest
+
+	opts := []ssh.Option{ssh.HostKeyFile(cli.Serve.HostKey)}
+
+	if users != nil {
+		opts = append(opts, ssh.PasswordAuth(func(ctx ssh.Context, password string) bool {
+			user := users[ctx.User()]
+			if user != nil && user.Password == password {
+				// TODO hash the password
+				return true
+			}
+			return false
+		}))
+
+		opts = append(opts, ssh.PublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
+			user := users[ctx.User()]
+			if user != nil && user.Key != nil {
+				return ssh.KeysEqual(key, user.Key)
+			}
+			return false
+		}))
+	}
+
 	go func() {
 		zap.L().Info("Listening for SSH connections.", zap.String("listenAddress", cli.Serve.SshListenAddress))
-		if err := ssh.ListenAndServe(cli.Serve.SshListenAddress, nil, ssh.HostKeyFile(cli.Serve.HostKey)); err != nil {
+		if err := ssh.ListenAndServe(cli.Serve.SshListenAddress, nil, opts...); err != nil {
 			zap.L().Fatal("Cannot listen for SSH connections.", zap.Error(err))
 		}
 	}()
@@ -326,4 +361,38 @@ func buildDomainName(subdomain string) string {
 
 func bindingToString(domain string, bindInfo BindInfo) string {
 	return fmt.Sprintf("%s forwarded to port %d", domain, bindInfo.BindPort)
+}
+
+func loadUsers() (map[string]*User, error) {
+	if cli.Serve.UsersFile == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(cli.Serve.UsersFile)
+	if err != nil {
+		return nil, err
+	}
+
+	rawUsers := make(map[string]*struct {
+		Password string
+		Key      string
+	})
+	if err := yaml.NewDecoder(f).Decode(&rawUsers); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]*User, len(rawUsers))
+	for username, userinfo := range rawUsers {
+		user := &User{Password: userinfo.Password}
+		if userinfo.Key != "" {
+			pubKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(userinfo.Key))
+			if err != nil {
+				return nil, fmt.Errorf("cannot unmarshal public key for user %s: %w", username, err)
+			}
+			user.Key = pubKey
+		}
+		result[username] = user
+	}
+
+	return result, nil
 }
